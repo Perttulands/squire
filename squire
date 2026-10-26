@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""A small, opt-in outside observer for one tmux agent pane."""
+import argparse
+import datetime
+from collections import deque
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+import unicodedata
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(os.environ.get('SQUIRE_STATE_DIR', Path.home() / '.local/state/squire')).expanduser().resolve()
+INPUT_BUDGET = 120000
+RAW_BATCH = 8 * 1024 * 1024
+SCHEMA = {'type': 'object', 'properties': {
+    'message': {'type': 'string'}, 'trajectory': {'type': 'string'},
+    'withdraw_undelivered': {'type': 'boolean'},
+}, 'required': ['message', 'trajectory', 'withdraw_undelivered'], 'additionalProperties': False}
+
+
+def run(args, **kw):
+    return subprocess.run(args, check=True, text=True, capture_output=True, **kw).stdout
+
+
+def tmux(socket, *args):
+    output = run([shutil.which('tmux') or 'tmux', '-S', socket, *args])
+    return output if args and args[0] == 'capture-pane' else output.strip()
+
+
+def save(path, value):
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    tmp.write_text(json.dumps(value, indent=2) + '\n')
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def load(path):
+    return json.loads(path.read_text())
+
+
+def pair_dir(name):
+    if not re.fullmatch(r'squire-[a-zA-Z0-9_-]+', name):
+        raise ValueError('invalid squire name')
+    path = STATE / name
+    if not path.is_dir():
+        raise ValueError('unknown squire: ' + name)
+    return path
+
+
+@contextlib.contextmanager
+def locked(path, nonblocking=False):
+    with path.open('a') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def detect_target(env=None):
+    env = os.environ if env is None else env
+    raw, pane = env.get('TMUX', ''), env.get('TMUX_PANE', '')
+    if not raw or not re.fullmatch(r'%\d+', pane):
+        raise ValueError('start must run inside the paired agent tmux pane (TMUX and TMUX_PANE)')
+    socket = raw.rsplit(',', 2)[0]
+    if not os.path.isabs(socket):
+        raise ValueError('TMUX must name an absolute socket')
+    target = tmux(socket, 'display-message', '-p', '-t', pane,
+                  '#{pane_id}\t#{session_id}\t#{window_id}\t#{pane_pid}\t#{pane_current_path}')
+    parts = target.split('\t')
+    if len(parts) != 5 or parts[0] != pane:
+        raise ValueError('tmux did not resolve the exact paired pane')
+    return dict(socket=socket, pane=pane, session=parts[1], window=parts[2], pane_pid=parts[3], cwd=parts[4])
+
+
+class PaneBlocked(ValueError):
+    """The paired harness is showing a dialog that typed input could accept."""
+
+
+BLOCKING_DIALOG = re.compile(
+    r'type something\.?|chat about this|enter to select|type your answer|none of the above'
+    r'|use this reset\?|you have\s+\d+\s+usage limit resets? available'
+    r'|(?:do you|do you want to|would you like to) (?:trust|allow|approve|proceed|run)'
+    r'|(?:press )?enter to confirm|(?:^|\n)\s*[❯>›]?\s*1\.\s*(?:yes|allow|approve|trust)'
+    r'|trust (?:this|the) (?:folder|directory|workspace)'
+    r'|yes,? proceed|allow (?:once|for this session)|requires? (?:your )?approval',
+    re.IGNORECASE,
+)
+
+
+def validate_target(config):
+    in_mode, _ = identity(config)
+    if in_mode:
+        raise PaneBlocked('paired pane is in copy mode')
+    screen = tmux(config['socket'], 'capture-pane', '-p', '-t', config['pane'])
+    if BLOCKING_DIALOG.search(screen):
+        raise PaneBlocked('paired harness has a blocking confirmation dialog')
+
+
+def effective_codex_home(env=None, home=None):
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else Path(home)
+    return Path(env.get('CODEX_HOME', home / '.codex')).expanduser().resolve()
+
+
+def discover_transcript(harness, cwd, env=None, home=None):
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else Path(home)
+    thread = env.get('CODEX_THREAD_ID')
+    if harness is None:
+        harness = 'codex' if thread else 'claude'
+    if harness == 'codex':
+        if not thread:
+            raise ValueError('CODEX_THREAD_ID is required for Codex discovery; supply --transcript explicitly')
+        codex_home = effective_codex_home(env, home)
+        matches = list((codex_home / 'sessions').glob('**/*' + thread + '.jsonl'))
+    else:
+        encoded = re.sub(r'[^a-zA-Z0-9-]', '-', str(Path(cwd).resolve()))
+        candidates = list((home / '.claude/projects' / encoded).glob('*.jsonl'))
+        session = env.get('CLAUDE_SESSION_ID') or env.get('CLAUDE_CODE_SESSION_ID')
+        if session:
+            matches = [p for p in candidates if p.stem == session]
+        else:
+            # Modification time cannot establish session ownership. The caller must
+            # identify its session explicitly when the project has more than one.
+            matches = candidates
+    if len(matches) != 1:
+        raise ValueError(f'{harness} transcript discovery found {len(matches)} candidates; supply --transcript with the exact live session path')
+    return harness, matches[0].resolve()
+
+
+INLINE_MEDIA = re.compile(r'data:(?:image|audio|video)/[^;,\s]+(?:;[^,\s]*)?,[^\s"\\]+', re.IGNORECASE)
+MEDIA_MARKER = '[inline media omitted; inspect a referenced local file with read-only tools]'
+
+
+def strip_inline_media(value, media=False):
+    """Keep causal text and file references, never feed encoded pixels to the model."""
+    if isinstance(value, str):
+        return INLINE_MEDIA.sub(MEDIA_MARKER, value)
+    if isinstance(value, list):
+        return [strip_inline_media(item, media) for item in value]
+    if not isinstance(value, dict):
+        return value
+    descriptor = ' '.join(str(value.get(key, '')) for key in ('type', 'kind', 'mime_type', 'media_type', 'mimeType'))
+    media = media or any(kind in descriptor.lower() for kind in ('image', 'audio', 'video'))
+    result = {}
+    for key, item in value.items():
+        if key == 'encrypted_content':
+            continue  # Opaque reasoning cipher is not observable evidence.
+        encoded = key in ('base64', 'b64_json', 'image_data', 'audio_data', 'encoded_data') or (media and key in ('data', 'bytes')) or (value.get('kind') == 'image_gen.generation' and key == 'result')
+        result[key] = MEDIA_MARKER if encoded else strip_inline_media(item, media or key in ('image', 'images', 'audio', 'video'))
+    return result
+
+
+def conversational(event, harness=None):
+    kind = event.get('type')
+    if kind == 'attachment' and harness in (None, 'claude'):
+        attachment = event.get('attachment')
+        if not isinstance(attachment, dict):
+            return False
+        origin = attachment.get('origin')
+        return (attachment.get('type') == 'queued_command'
+                and isinstance(origin, dict)
+                and (origin.get('kind') == 'human'
+                     or (origin.get('kind') == 'channel' and attachment.get('commandMode') == 'prompt'))
+                and isinstance(attachment.get('prompt'), (str, list)))
+    if harness == 'claude' or (harness is None and kind in ('user', 'assistant')):
+        message = event.get('message', {})
+        return kind in ('user', 'assistant') and isinstance(message, dict) and message.get('role', kind) == kind
+    if harness not in (None, 'codex'):
+        return False
+    if kind == 'response_item':
+        item = event.get('payload', {})
+        if not isinstance(item, dict):
+            return False
+        subtype = item.get('type')
+        if subtype == 'message' or (subtype is None and item.get('role')):
+            return item.get('role') in ('user', 'assistant')
+        if subtype == 'reasoning':
+            summary = item.get('summary', [])
+            return isinstance(summary, list) and any(isinstance(part, dict) and isinstance(part.get('text'), str) and part['text'].strip() for part in summary)
+        return subtype in ('function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output')
+    if kind == 'event_msg':
+        payload = event.get('payload', {})
+        item = payload.get('item', {}) if isinstance(payload, dict) else {}
+        return isinstance(item, dict) and item.get('kind') == 'image_gen.generation'
+    return False
+
+
+def render_record(line, harness=None):
+    """One parse, allowlist and render per source record."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return '\n', ''
+    if not isinstance(event, dict) or not conversational(event, harness):
+        return '\n', ''
+    if event.get('type') == 'attachment':
+        attachment = event['attachment']
+        event = {'type': 'user', 'queued_mid_turn': True,
+                 'timestamp': event.get('timestamp', attachment.get('timestamp')),
+                 'message': {'role': 'user', 'content': attachment['prompt']}}
+    clean = strip_inline_media(event)
+    compact = json.dumps(clean, ensure_ascii=False)
+    rendered = compact if len(compact) <= 16000 else compact[:12000] + '\n[long record excerpted]\n' + compact[-4000:]
+    return compact + '\n', rendered
+
+
+def normalize(data):
+    return '\n'.join(text for _, text in (render_record(line) for line in data.splitlines()) if text)
+
+
+def batches(records, cursor, harness=None):
+    """Shared live/replay batching; records are complete native byte strings."""
+    selected, rendered, cost, retained = [], [], 0, 0
+    position = dict(cursor)
+    first = position['line'] + 1
+    for raw in records:
+        clean, text = render_record(raw.decode('utf-8'), harness)
+        size = len(clean.encode('utf-8'))
+        if selected and (cost + len(text) + 64 > INPUT_BUDGET or retained + size > RAW_BATCH):
+            yield {'data': ''.join(selected), 'rendered': '\n'.join(rendered), 'cursor': dict(position), 'first': first, 'last': position['line']}
+            selected, rendered, cost, retained = [], [], 0, 0
+            first = position['line'] + 1
+        selected.append(clean)
+        if text:
+            rendered.append(f'line {position["line"] + 1}: ' + text)
+        cost += len(text) + 64
+        retained += size
+        position['line'] += 1
+        position['offset'] += len(raw)
+    if selected:
+        yield {'data': ''.join(selected), 'rendered': '\n'.join(rendered), 'cursor': dict(position), 'first': first, 'last': position['line']}
+
+
+def file_records(path, cursor, through=None):
+    stat = path.stat()
+    identity = [stat.st_dev, stat.st_ino]
+    if cursor.get('identity') not in (None, identity) or stat.st_size < cursor['offset']:
+        raise ValueError('transcript was replaced or truncated; restart with the correct transcript')
+    end = stat.st_size if through is None else min(through, stat.st_size)
+    with path.open('rb') as handle:
+        handle.seek(cursor['offset'])
+        while handle.tell() < end:
+            raw = handle.readline(end - handle.tell())
+            if not raw.endswith(b'\n'):
+                return
+            yield raw
+
+
+def live_batches(path, cursor, through=None, harness=None):
+    position = dict(cursor)
+    if position.get('identity') is None:
+        stat = path.stat()
+        position['identity'] = [stat.st_dev, stat.st_ino]
+    yield from batches(file_records(path, position, through), position, harness)
+
+
+def recent_start(path, harness):
+    """A bounded recent suffix ending at complete EOF, never a historical drain."""
+    recent = deque()
+    cost = retained = 0
+    cursor = {'line': 0, 'offset': 0, 'identity': [path.stat().st_dev, path.stat().st_ino]}
+    for raw in file_records(path, cursor):
+        clean, text = render_record(raw.decode('utf-8'), harness)
+        recent.append((len(raw), len(text) + 64, len(clean.encode('utf-8'))))
+        cost += recent[-1][1]
+        retained += recent[-1][2]
+        cursor['line'] += 1
+        cursor['offset'] += len(raw)
+        while len(recent) > 1 and (cost > INPUT_BUDGET or retained > RAW_BATCH):
+            _, old_cost, old_size = recent.popleft()
+            cost -= old_cost
+            retained -= old_size
+    before = dict(cursor)
+    before['line'] -= len(recent)
+    before['offset'] -= sum(length for length, _, _ in recent)
+    return cursor, before
+
+
+def record_time(line):
+    try:
+        value = json.loads(line).get('timestamp')
+        if isinstance(value, (float, int)):
+            return float(value) / (1000 if value > 10**11 else 1)
+        if isinstance(value, str):
+            return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def replay_ranges(lines, start, end, chunk_lines, interval):
+    if chunk_lines:
+        for index in range(start, end, chunk_lines):
+            yield index, min(index + chunk_lines, end)
+        return
+    index = start
+    began = None
+    found = False
+    for position in range(start, end):
+        stamp = record_time(lines[position])
+        if stamp is None:
+            continue
+        found = True
+        if began is None:
+            began = stamp
+        elif stamp - began >= interval:
+            yield index, position
+            index, began = position, stamp
+    if not found:
+        raise ValueError('replay cadence needs timestamps; use --chunk-lines explicitly for untimed data')
+    if index < end:
+        yield index, end
+
+
+def log_turn(directory, message):
+    line = time.strftime('%H:%M:%S ') + message
+    with (directory / 'turns.log').open('a') as handle:
+        handle.write(line + '\n')
+    print(line, flush=True)
+
+
+def codex_turn(directory, config, prompt):
+    """Keep one real Codex conversation, using notes only when its rollout is lost."""
+    schema = directory / 'schema.json'
+    save(schema, SCHEMA)
+    output = directory / 'decision.json'
+    output.unlink(missing_ok=True)
+    thread_file = directory / 'thread.json'
+    thread = load(thread_file).get('thread_id') if thread_file.exists() else None
+    command = [shutil.which('codex') or 'codex', 'exec', '--ignore-user-config', '--skip-git-repo-check', '-s', 'read-only', '-m', config['model'], '-c', 'model_reasoning_effort=' + json.dumps(config['effort']), '--disable', 'multi_agent', '--disable', 'image_generation', '--disable', 'sleep_tool', '--disable', 'browser_use', '--disable', 'browser_use_external', '--disable', 'browser_use_full_cdp_access', '--json', '--output-schema', str(schema), '-o', str(output), '-C', str(directory)]
+    command += ['resume', thread, '-'] if thread else ['-']
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    previous = {}
+    def interrupted(signum, frame):
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        previous[sig] = signal.signal(sig, interrupted)
+    try:
+        events, errors = process.communicate(prompt(not thread) if callable(prompt) else prompt)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    with (directory / 'checks.log').open('a') as log:
+        log.write(events + errors)
+    for line in events.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get('type') == 'thread.started':
+            actual = event.get('thread_id')
+            if not actual or (thread and actual != thread):
+                raise ValueError('Codex returned an unexpected thread identity')
+            save(thread_file, {'thread_id': actual})
+            if not thread:
+                log_turn(directory, 'Codex thread ' + actual)
+    if process.returncode:
+        # This exact error is emitted by the installed CLI before any model call.
+        # Network, authentication, model and generic errors never create new sessions.
+        if thread and 'no rollout found for thread id ' + thread in errors + events:
+            thread_file.unlink(missing_ok=True)
+            log_turn(directory, 'Saved Codex thread is missing; rebuilding from current notes.')
+            return codex_turn(directory, config, prompt)
+        raise ValueError(f'Codex turn failed ({process.returncode}); see {directory / "checks.log"}')
+    if not thread_file.exists():
+        raise ValueError('Codex did not report a persistent thread identity')
+    decision = load(output)
+    if (not isinstance(decision, dict) or set(decision) != set(SCHEMA['required'])
+            or any(not isinstance(decision[key], str) for key in ('message', 'trajectory'))
+            or not isinstance(decision['withdraw_undelivered'], bool)):
+        raise ValueError('invalid decision JSON')
+    return decision
+
+
+def judge(directory, config, notes, data, first, last, request=None, rendered=None):
+    def prompt(bootstrap):
+        payload = {'mode': config.get('mode', 'live'), 'observer_mode': config.get('observer_mode', 'guard'), 'transcript_path': config.get('transcript'), 'transcript_line_count': last if last is not None else (load(directory / 'cursor.json')['line'] if (directory / 'cursor.json').exists() else config.get('transcript_line_count', 0)), 'snapshot_line_offset': config.get('snapshot_line_offset', 0), 'new_range': [first, last] if data else None, 'transcript_increment': rendered if rendered is not None else normalize(data), 'agent_request': request}
+        pending_path = directory / 'pending.json'
+        pending = load(pending_path) if pending_path.exists() else None
+        payload['undelivered'] = {key: pending.get(key) for key in ('message', 'deferred_reason', 'since')} if pending else None
+        if bootstrap:
+            payload.update(plan=notes['plan'], trajectory=notes['trajectory'], said=notes['said'], tuning=notes['tuning'])
+            return (ROOT / 'instructions/squire.md').read_text() + '\n\n' + json.dumps(payload, ensure_ascii=False)
+        # Continuity lives in the thread. Receipts distinguish sent advice from proposals.
+        payload['delivery_receipt'] = notes.get('delivery_receipt')
+        payload['tuning'] = notes.get('new_tuning', [])
+        return json.dumps(payload, ensure_ascii=False)
+    return codex_turn(directory, config, prompt)
+
+
+def halt(directory, reason):
+    config = load(directory / 'config.json')
+    config.update(stopped=True, stop_reason=reason)
+    save(directory / 'config.json', config)
+    log_turn(directory, 'Stopped: ' + reason)
+
+
+def worker_alive(directory, config):
+    if config.get('stopped'):
+        return False
+    try:
+        with locked(directory / 'worker.lock', nonblocking=True) as acquired:
+            return not acquired
+    except OSError:
+        return False
+
+
+def identity(config):
+    result = tmux(config['socket'], 'display-message', '-p', '-t', config['pane'], '#{pane_id}\t#{session_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_in_mode}\t#{cursor_y}')
+    fields = result.split('\t')
+    expected = [config[key] for key in ('pane', 'session', 'pane_pid', 'harness')]
+    if len(fields) != 6 or fields[:4] != expected:
+        raise ValueError('paired pane identity or harness changed')
+    return fields[4] == '1', int(fields[5])
+
+
+def claude_rule(line):
+    """An unindented rule, optionally interrupted by one short session title."""
+    match = re.fullmatch(r'[─━]{3,}(?: ([^─━]{1,62}) [─━]+)?', line)
+    if not match:
+        return False
+    title = match.group(1)
+    return title is None or (title.isprintable() and title == title.strip())
+
+
+def composer(screen, harness, cursor_y):
+    """Recognize one ordinary prompt row; never interpret multiline drafts."""
+    lines = screen.splitlines()
+    marker = '›' if harness == 'codex' else '❯'
+    if not 0 <= cursor_y < len(lines) or not lines[cursor_y].startswith(marker):
+        raise PaneBlocked('composer is not a known single prompt row')
+    if harness == 'claude':
+        if cursor_y == 0 or cursor_y + 1 >= len(lines) or not claude_rule(lines[cursor_y - 1]) or not claude_rule(lines[cursor_y + 1]):
+            raise PaneBlocked('composer is not a plain single-row Claude frame')
+    else:
+        footers = [i for i in range(cursor_y + 1, len(lines)) if lines[i].strip().startswith('GPT-')]
+        if not footers or any(line.strip() for line in lines[cursor_y + 1:footers[-1]]):
+            raise PaneBlocked('composer is multiline or has an unknown footer')
+    text = lines[cursor_y][1:].strip()
+    if harness == 'codex' and text in ('Ask Codex to do anything', 'Implement {feature}', 'Find and fix a bug in @filename'):
+        return ''
+    if text and all(0x2800 <= ord(c) <= 0x28ff or c.isspace() for c in text):
+        return ''
+    return text
+
+
+def normal_frame(screen, harness, cursor_y):
+    """Only recognize ordinary harness chrome; never interpret wrapped text."""
+    lines = screen.splitlines()
+    if not 0 <= cursor_y < len(lines):
+        raise PaneBlocked('normal harness frame is not recognizable')
+    if harness == 'claude':
+        rules = [i for i, line in enumerate(lines) if claude_rule(line)]
+        above, below = [i for i in rules if i < cursor_y], [i for i in rules if i > cursor_y]
+        known = bool(above and below and lines[above[-1] + 1].startswith('❯'))
+    else:
+        known = lines[cursor_y].startswith(('›', '  ')) and any(line.strip().startswith('GPT-') for line in lines[cursor_y + 1:])
+    if not known:
+        raise PaneBlocked('normal harness frame is not recognizable')
+
+
+def safe_state(config, recent_activity=True):
+    in_mode, cursor_y = identity(config)
+    if in_mode:
+        raise PaneBlocked('paired pane is in copy mode')
+    screen = tmux(config['socket'], 'capture-pane', '-p', '-t', config['pane'])
+    if BLOCKING_DIALOG.search(screen):
+        raise PaneBlocked('paired harness has a blocking dialog')
+    normal_frame(screen, config['harness'], cursor_y)
+    if recent_activity:
+        clients = tmux(config['socket'], 'list-clients', '-F', '#{session_id}\t#{client_activity}')
+        for client in clients.splitlines():
+            session, _, activity = client.partition('\t')
+            if session == config['session'] and time.time() - float(activity) < 60:
+                raise PaneBlocked('paired session has recent human client activity')
+    return screen, cursor_y
+
+
+def safe_composer(config, recent_activity=True):
+    screen, cursor_y = safe_state(config, recent_activity)
+    return composer(screen, config['harness'], cursor_y)
+
+
+def short_message(message):
+    # Never allow terminal editing controls to erase the prefix or choose a dialog.
+    if any(unicodedata.category(c) == 'Cc' and not c.isspace() for c in message):
+        raise ValueError('message contains terminal control characters')
+    return ' '.join(message.split())[:400].rstrip()
+
+
+def deliver(directory, message, expected_tuning=None):
+    message = short_message(message)
+    if not message:
+        return True
+    with locked(directory / 'delivery.lock'):
+        config = load(directory / 'config.json')
+        if config.get('stopped'):
+            raise ValueError('squire is stopped')
+        with locked(directory / 'notes.lock'):
+            notes = load(directory / 'notes.json')
+            if expected_tuning is not None and len(notes['tuning']) != expected_tuning:
+                log_turn(directory, 'Dropped advice superseded by tuning.')
+                return True
+            if safe_composer(config):
+                raise PaneBlocked('paired composer already contains a draft')
+            staged = '[squire] ' + message
+            tmux(config['socket'], 'send-keys', '-t', config['pane'], '-l', '--', staged)
+            time.sleep(0.25)
+            try:
+                # Input was proven empty before insertion; no intervening client
+                # keys, copy mode or widget may precede the one submit.
+                safe_state(config)
+                tmux(config['socket'], 'send-keys', '-t', config['pane'], 'Enter')
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                try:
+                    # Ignore client activity only for clearing this exact owned text.
+                    if safe_composer(config, recent_activity=False) != staged:
+                        raise PaneBlocked('owned draft is no longer exactly identifiable')
+                    tmux(config['socket'], 'send-keys', '-t', config['pane'], 'C-u')
+                    time.sleep(0.25)
+                    if safe_composer(config, recent_activity=False):
+                        raise PaneBlocked('owned draft did not clear')
+                    log_turn(directory, 'Cleared unsubmitted owned draft after failed safety check.')
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    halt(directory, 'retained draft: safety changed after typing; no safe rollback')
+                raise
+            try:
+                notes['said'].append({'time': time.time(), 'message': message})
+                notes['delivery_receipt'] = {'message': message, 'status': 'sent'}
+                save(directory / 'notes.json', notes)
+                log_turn(directory, 'Said: ' + message)
+            except Exception as error:
+                halt(directory, 'delivery submitted but receipt persistence failed: ' + str(error))
+                raise
+        return True
+
+
+def deliver_pending(directory):
+    path = directory / 'pending.json'
+    if not path.exists() or load(directory / 'config.json').get('stopped'):
+        return False
+    pending = load(path)
+    if pending.get('held') or pending.get('retry_after', 0) > time.time():
+        return False
+    try:
+        delivered = deliver(directory, pending['message'], pending['tuning_version'])
+    except Exception as error:
+        if not isinstance(error, PaneBlocked):
+            record_failure(directory, load(directory / 'cursor.json'), error)
+        same_reason = pending.get('deferred_reason') == str(error)
+        if not same_reason:
+            log_turn(directory, 'Delivery deferred: ' + str(error))
+        count = pending.get('deferral_count', 0) + 1 if same_reason else 1
+        pending.update(deferred_reason=str(error), deferral_count=count, retry_after=time.time() + load(directory / 'config.json').get('interval', 360))
+        save(path, pending)
+        return False
+    if delivered:
+        path.unlink(missing_ok=True)
+    return delivered
+
+
+def record_failure(directory, cursor, error):
+    path = directory / 'failure.json'
+    old = load(path) if path.exists() else {}
+    count = old.get('count', 0) + 1 if old.get('cursor') == cursor else 1
+    save(path, {'cursor': cursor, 'count': count, 'reason': str(error)})
+    if count >= 3:
+        halt(directory, 'three consecutive failures at unchanged cursor: ' + str(error))
+
+
+def consume_bootstrap(directory, cursor):
+    path = directory / 'bootstrap.json'
+    if path.exists() and cursor['offset'] >= load(path)['end']['offset']:
+        path.unlink()
+
+
+def commit_decision(directory, notes, decision, cursor=None, tuning_version=None, catching_up=False):
+    with locked(directory / 'notes.lock'):
+        latest = load(directory / 'notes.json')
+        latest['trajectory'] = decision['trajectory']
+        stale = len(latest['tuning']) != tuning_version
+        save(directory / 'notes.json', latest)
+    if cursor is not None:
+        save(directory / 'cursor.json', cursor)
+        consume_bootstrap(directory, cursor)
+    (directory / 'failure.json').unlink(missing_ok=True)
+    pending = directory / 'pending.json'
+    if stale:
+        pending.unlink(missing_ok=True)
+        log_turn(directory, 'Kept judgment; dropped only advice superseded by tuning.')
+        return
+    message = ''
+    if decision['message']:
+        try:
+            message = short_message(decision['message'])
+        except ValueError as error:
+            log_turn(directory, 'Kept judgment; discarded invalid advice: ' + str(error))
+    previous = load(pending) if pending.exists() else None
+    if message:
+        replacement = {'message': message, 'tuning_version': tuning_version, 'since': time.time(), 'held': catching_up}
+        if previous:
+            replacement.update({key: previous[key] for key in ('deferred_reason', 'deferral_count') if key in previous})
+        save(pending, replacement)
+    elif decision['withdraw_undelivered']:
+        if previous:
+            pending.unlink()
+            log_turn(directory, 'Withdrew undelivered advice.')
+    elif previous:
+        previous.update(tuning_version=tuning_version, held=catching_up)
+        save(pending, previous)
+
+
+def check_once(directory, through=None, batch=None, catching_up=False):
+    config = load(directory / 'config.json')
+    if config.get('stopped'):
+        return False
+    cursor = load(directory / 'cursor.json')
+    try:
+        validate_target(config)
+        if batch is None:
+            batch = next(live_batches(Path(config['transcript']), cursor, through, config['harness']), None)
+        if batch is None:
+            return False
+        if not batch['rendered']:
+            save(directory / 'cursor.json', batch['cursor'])
+            consume_bootstrap(directory, batch['cursor'])
+            return True
+        notes = load(directory / 'notes.json')
+        version = len(notes['tuning'])
+        log_turn(directory, f'Check transcript lines {batch["first"]}-{batch["last"]}')
+        decision = judge(directory, config, notes, batch['data'], batch['first'], batch['last'], rendered=batch['rendered'])
+        commit_decision(directory, notes, decision, batch['cursor'], version, catching_up=catching_up)
+    except PaneBlocked:
+        return False
+    except Exception as error:
+        record_failure(directory, cursor, error)
+        raise
+    log_turn(directory, f'Judged lines {batch["first"]}-{batch["last"]}: ' + (decision['message'] or 'silent'))
+    # Delivery is deliberately outside judgment failure/cursor handling.
+    try:
+        if not catching_up:
+            deliver_pending(directory)
+    except Exception as error:
+        log_turn(directory, 'Delivery failed: ' + str(error))
+    return True
+
+
+
+
+def queue_tell(directory, message):
+    if not message.strip():
+        raise ValueError('tell needs a nonempty message')
+    if not worker_alive(directory, load(directory / 'config.json')):
+        raise ValueError('squire worker is not running')
+    with locked(directory / 'notes.lock'):
+        notes = load(directory / 'notes.json')
+        notes['tuning'].append({'id': uuid.uuid4().hex, 'time': time.time(), 'message': message, 'status': 'pending'})
+        save(directory / 'notes.json', notes)
+
+
+def pending_tell(directory):
+    return any(item.get('status') == 'pending' for item in load(directory / 'notes.json')['tuning'])
+
+
+def process_tell_once(directory):
+    config = load(directory / 'config.json')
+    if config.get('stopped'):
+        return False
+    with locked(directory / 'notes.lock'):
+        notes = load(directory / 'notes.json')
+        request = next((item for item in notes['tuning'] if item.get('status') == 'pending'), None)
+        if request is None:
+            return False
+        request['status'] = 'running'
+        save(directory / 'notes.json', notes)
+    log_turn(directory, 'Agent says: ' + request['message'])
+    cursor = load(directory / 'cursor.json')
+    try:
+        decision = judge(directory, config, notes, '', None, None, request=request['message'])
+        commit_decision(directory, notes, decision, tuning_version=len(notes['tuning']))
+        status = 'done'
+    except Exception as error:
+        record_failure(directory, cursor, error)
+        log_turn(directory, 'Tell failed: ' + str(error))
+        status = 'failed'
+    with locked(directory / 'notes.lock'):
+        latest = load(directory / 'notes.json')
+        entry = next(item for item in latest['tuning'] if item.get('id') == request['id'])
+        entry['status'] = status
+        save(directory / 'notes.json', latest)
+    try:
+        deliver_pending(directory)
+    except Exception as error:
+        log_turn(directory, 'Reply delivery failed: ' + str(error))
+    return True
+
+
+def wait_for_work(directory, timeout):
+    """Cheap local polling wakes a tell promptly without changing transcript cadence."""
+    deadline = time.monotonic() + timeout
+    while not load(directory / 'config.json').get('stopped'):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or pending_tell(directory):
+            return
+        time.sleep(min(1, remaining))
+        pending = directory / 'pending.json'
+        if pending.exists():
+            advice = load(pending)
+            if not advice.get('held') and advice.get('retry_after', 0) <= time.time():
+                return
+
+
+def worker(name):
+    directory = pair_dir(name)
+    with locked(directory / 'worker.lock', nonblocking=True) as acquired:
+        if not acquired:
+            raise ValueError('worker already running')
+        config = load(directory / 'config.json')
+        log_turn(directory, f"Observer {config.get('observer_mode', 'guard')} for {config['harness']} {config['pane']}; cadence {config.get('interval', 360):g}s")
+        next_check = 0
+        while not load(directory / 'config.json').get('stopped'):
+            check_owns_failure = False
+            try:
+                while process_tell_once(directory):
+                    pass
+                if time.monotonic() >= next_check:
+                    config = load(directory / 'config.json')
+                    through = Path(config['transcript']).stat().st_size
+                    cursor = load(directory / 'cursor.json')
+                    bootstrap = directory / 'bootstrap.json'
+                    boot = load(bootstrap) if bootstrap.exists() else None
+                    start_cursor = boot['start'] if boot else cursor
+                    if boot:
+                        through = boot['end']['offset']
+                    pending_batches = list(live_batches(Path(config['transcript']), start_cursor, through, config['harness']))
+                    if boot and not pending_batches:
+                        consume_bootstrap(directory, boot['end'])
+                    for index, batch in enumerate(pending_batches):
+                        later = any(item['rendered'] for item in pending_batches[index + 1:])
+                        check_owns_failure = True
+                        progressed = check_once(directory, through, batch, later)
+                        check_owns_failure = False
+                        if not progressed or (pending_tell(directory) and index + 1 < len(pending_batches)):
+                            break
+                    next_check = time.monotonic() + config['interval']
+            except Exception as error:
+                if not check_owns_failure:
+                    record_failure(directory, load(directory / 'cursor.json'), error)
+                log_turn(directory, 'Check failed: ' + str(error))
+                next_check = time.monotonic() + load(directory / 'config.json')['interval']
+            try:
+                deliver_pending(directory)
+            except Exception as error:
+                log_turn(directory, 'Pending delivery failed: ' + str(error))
+            current = load(directory / 'config.json')
+            if not current.get('stopped'):
+                wait_for_work(directory, max(0, next_check - time.monotonic()))
+
+
+def plan(args):
+    value = Path(args.plan_file).read_text() if args.plan_file else args.plan
+    if not value or not value.strip():
+        raise ValueError('supply a nonempty --plan or --plan-file')
+    return value
+
+
+def start(args):
+    with locked(STATE / 'lifecycle.lock'):
+        start_pair(args)
+
+
+def start_pair(args):
+    text_plan = plan(args)
+    target = detect_target()
+    harness = args.harness
+    if args.transcript:
+        transcript = Path(args.transcript).resolve()
+        harness = harness or ('codex' if os.environ.get('CODEX_THREAD_ID') else 'claude')
+    else:
+        harness, transcript = discover_transcript(harness, target['cwd'])
+    if not transcript.is_file():
+        raise ValueError('transcript does not exist: ' + str(transcript))
+    validate_target(dict(target, harness=harness))
+    for path in STATE.glob('squire-*/config.json'):
+        existing = load(path)
+        if not existing.get('stopped') and all(existing.get(k) == target[k] for k in ('socket', 'pane', 'pane_pid')):
+            if worker_alive(path.parent, existing):
+                raise ValueError('pane already has a squire: ' + path.parent.name)
+            existing.update(stopped=True, stop_reason='worker missing; replaced by a new pair')
+            save(path, existing)
+    name = 'squire-' + uuid.uuid4().hex[:10]
+    directory = STATE / name
+    directory.mkdir(parents=True, mode=0o700)
+    directory.chmod(0o700)
+    config = dict(target, name=name, harness=harness, transcript=str(transcript), interval=args.interval, model=args.model, effort=args.effort, observer_mode=getattr(args, 'observer_mode', 'guard'), stopped=False)
+    save(directory / 'config.json', config)
+    save(directory / 'notes.json', {'plan': text_plan, 'trajectory': '', 'said': [], 'tuning': []})
+    current, recent = recent_start(transcript, harness)
+    save(directory / 'cursor.json', current)
+    save(directory / 'bootstrap.json', {'start': recent, 'end': current})
+    # tmux's server may predate this shell's environment, especially custom
+    # state/auth locations. Carry these paths explicitly to the new window.
+    worker_env = ['SQUIRE_STATE_DIR=' + str(STATE), 'CODEX_HOME=' + str(effective_codex_home())]
+    if 'PATH' in os.environ:
+        worker_env.append('PATH=' + os.environ['PATH'])
+    command = shlex.join(['env', *worker_env, sys.executable, str(ROOT / 'squire'), '_worker', name])
+    try:
+        own_pane = tmux(target['socket'], 'new-window', '-a', '-d', '-P', '-F', '#{pane_id}', '-t', target['window'], '-n', name, '-c', target['cwd'], command)
+        own_window = tmux(target['socket'], 'display-message', '-p', '-t', own_pane, '#{window_id}')
+        config.update(observer_pane=own_pane, observer_window=own_window)
+        save(directory / 'config.json', config)
+        validate_target(config)
+        deadline = time.monotonic() + 3
+        while not worker_alive(directory, config):
+            if time.monotonic() >= deadline:
+                raise ValueError('observer worker did not start')
+            time.sleep(0.05)
+    except Exception:
+        config['stopped'] = True
+        save(directory / 'config.json', config)
+        raise
+    print(name)
+
+
+def replay(args):
+    text_plan = plan(args)
+    source = Path(args.transcript).resolve()
+    lines = source.read_text().splitlines(keepends=True)
+    end = args.end_line or len(lines)
+    if args.start_line < 1 or end < args.start_line or end > len(lines):
+        raise ValueError('invalid replay line range')
+    output = Path(args.output).resolve()
+    if output == source:
+        raise ValueError('replay output cannot overwrite transcript')
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='squire-replay-', dir=STATE if STATE.exists() else None) as tmp:
+        directory = Path(tmp)
+        notes = {'plan': text_plan, 'trajectory': '', 'said': [], 'tuning': []}
+        config = {'model': args.model, 'effort': args.effort, 'mode': 'replay', 'observer_mode': getattr(args, 'observer_mode', 'guard'), 'transcript': str(directory / 'revealed.jsonl'), 'snapshot_line_offset': args.start_line - 1}
+        with output.open('w') as handle:
+            cadence = replay_ranges(lines, args.start_line - 1, end, args.chunk_lines, getattr(args, 'interval', 360))
+            for cadence_first, cadence_last in cadence:
+                initial = {'line': cadence_first, 'offset': 0, 'identity': None}
+                prepared = list(batches((line.encode('utf-8') for line in lines[cadence_first:cadence_last]), initial, getattr(args, 'harness', None)))
+                for position, batch in enumerate(prepared):
+                    index, last = batch['first'] - 1, batch['last']
+                    with Path(config['transcript']).open('a') as revealed:
+                        revealed.write(batch['data'])
+                    decision = judge(directory, config, notes, batch['data'], index + 1, last, rendered=batch['rendered']) if batch['rendered'] else {'message': '', 'trajectory': notes['trajectory'], 'withdraw_undelivered': False}
+                    catching_up = any(item['rendered'] for item in prepared[position + 1:])
+                    notes['trajectory'] = decision['trajectory']
+                    if catching_up:
+                        decision = dict(decision, message='')
+                    decision['message'] = short_message(decision['message'])
+                    record = {'thread_id': load(directory / 'thread.json')['thread_id'] if (directory / 'thread.json').exists() else None, 'source': str(source), 'first_line': index + 1, 'last_line': last, 'catching_up': catching_up, **decision}
+                    handle.write(json.dumps(record) + '\n')
+                    handle.flush()
+                    if decision['message']:
+                        notes['said'].append({'line': last, 'message': decision['message']})
+                    print(f'lines {index+1}-{last}: {decision["message"] or "silent"}', flush=True)
+
+
+def stop_pair(directory):
+    with locked(directory / 'delivery.lock'):
+        config = load(directory / 'config.json')
+        config['stopped'] = True
+        config.setdefault('stop_reason', 'stopped by request')
+        save(directory / 'config.json', config)
+    if not config.get('observer_pane'):
+        return
+    def still_present():
+        panes = tmux(config['socket'], 'list-panes', '-a', '-F', '#{pane_id}\t#{window_id}').splitlines()
+        matches = [line for line in panes if line.split('\t')[0] == config['observer_pane']]
+        if not matches:
+            return False
+        if matches != [config['observer_pane'] + '\t' + config['observer_window']]:
+            raise ValueError('observer pane identity changed; refusing to stop another pane')
+        return True
+    if still_present():
+        try:
+            tmux(config['socket'], 'kill-pane', '-t', config['observer_pane'])
+        except subprocess.SubprocessError:
+            # The worker can observe stopped and exit between inventory and kill.
+            # Only verified absence is success; identity/server/kill errors survive.
+            if still_present():
+                raise
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    for verb in ('start', 'replay'):
+        child = sub.add_parser(verb)
+        plans = child.add_mutually_exclusive_group(required=True)
+        plans.add_argument('--plan')
+        plans.add_argument('--plan-file')
+        child.add_argument('--mode', dest='observer_mode', choices=['guard', 'assist'], default='guard')
+        child.add_argument('--model', default='gpt-6.1-sol')
+        child.add_argument('--effort', default='medium', choices=['low', 'medium', 'high'])
+        if verb == 'start':
+            child.add_argument('--harness', choices=['codex', 'claude'])
+            child.add_argument('--transcript')
+            child.add_argument('--interval', type=float, default=360)
+        else:
+            child.add_argument('transcript')
+            child.add_argument('--start-line', type=int, default=1)
+            child.add_argument('--end-line', type=int)
+            child.add_argument('--chunk-lines', type=int, help='explicit untimed chunking override')
+            child.add_argument('--interval', type=float, default=360)
+            child.add_argument('--output', required=True)
+    for verb in ('tell', 'stop', '_worker'):
+        child = sub.add_parser(verb)
+        child.add_argument('name')
+        if verb == 'tell':
+            child.add_argument('message')
+    sub.add_parser('status')
+    args = parser.parse_args(argv)
+    if getattr(args, 'interval', 1) <= 0 or (getattr(args, 'chunk_lines', None) is not None and args.chunk_lines <= 0):
+        parser.error('interval and chunk-lines must be positive')
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.command == 'start':
+        start(args)
+    elif args.command == 'replay':
+        replay(args)
+    elif args.command == 'status':
+        for path in sorted(STATE.glob('squire-*/config.json')):
+            cfg = load(path)
+            alive = worker_alive(path.parent, cfg)
+            pending_path = path.parent / 'pending.json'
+            pending = load(pending_path) if pending_path.exists() else {}
+            deferred = pending.get('deferred_reason')
+            try:
+                unread = Path(cfg['transcript']).stat().st_size > load(path.parent / 'cursor.json')['offset']
+                watching = 'watched file has unread growth' if unread else 'watched file is idle'
+            except OSError:
+                watching = 'watched file unavailable'
+            reason = cfg.get('stop_reason') or ('worker missing' if not alive else watching)
+            if deferred:
+                count = pending.get('deferral_count', 0)
+                reason += f'; 1 undelivered; delivery deferred x{count}: {deferred}' if count >= 2 else '; delivery deferred: ' + deferred
+            reason += '; fixed path: restart after /clear or /new'
+            print(f'{path.parent.name}\t{"running" if alive else "stopped" if cfg.get("stopped") else "missing worker"}\t{cfg["harness"]}\t{cfg["pane"]}\t{cfg["socket"]}\t{reason}')
+    else:
+        directory = pair_dir(args.name)
+        if args.command == 'tell':
+            queue_tell(directory, args.message)
+            print('Message queued for the squire conversation.')
+        elif args.command == 'stop':
+            stop_pair(directory)
+        else:
+            worker(args.name)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print('squire:', error, file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Local task records, private evaluations, and runtime state
+.beads/
+evals/
+.squire/
