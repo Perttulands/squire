@@ -711,18 +711,33 @@ class Mechanics(unittest.TestCase):
         for text in ('Type something.', 'Chat about this', 'Enter to select', 'Type your answer', 'None of the above', 'Use this reset?', 'You have 3 usage limit resets available'):
             self.assertIsNotNone(squire.BLOCKING_DIALOG.search(text))
 
-    def test_other_session_activity_does_not_block_and_message_is_capped(self):
+    def test_other_session_activity_does_not_block_and_long_message_arrives_whole(self):
         self.client = '$999\t' + str(squire.time.time())
-        message = '  Inspect\n the\t upstream anchor. ' * 50
+        message = ''.join(f'  Inspect\n the\t upstream anchor number {i}. ' for i in range(60))
+        expected = ' '.join(message.split())
+        self.assertGreater(len(expected), 2000)
         with patch.object(squire, 'tmux', side_effect=self.transport), patch.object(squire.time, 'sleep'), patch('builtins.print'):
             squire.deliver(self.directory, message)
         literals = [args[-1] for args in self.sent if '-l' in args]
         self.assertEqual(len(literals), 1)
-        self.assertLessEqual(len(literals[0]) - len('[squire] '), 400)
+        self.assertEqual(literals[0], '[squire] ' + expected)
+        self.assertEqual(squire.load(self.directory / 'notes.json')['said'][-1]['message'], expected)
         self.assertNotIn('\n', literals[0])
         self.assertEqual(sum(args[-1] == 'Enter' for args in self.sent), 1)
         with self.assertRaises(ValueError):
             squire.deliver(self.directory, '\x7f' * 9 + '/usage')
+
+    def test_message_past_safety_cap_ends_on_sentence_and_saves_full_text(self):
+        message = ' '.join(f'Sentence {i} explains one more point.' for i in range(200))
+        self.assertGreater(len(message), squire.MESSAGE_LIMIT)
+        short = squire.short_message(message, self.directory)
+        self.assertLessEqual(len(short), squire.MESSAGE_LIMIT)
+        head, marker, path = short.partition(' (truncated, full text at ')
+        self.assertTrue(marker)
+        self.assertTrue(head.endswith('point.'))
+        self.assertTrue(message.startswith(head))
+        self.assertEqual(Path(path.rstrip(')')).read_text(), message + '\n')
+        self.assertEqual(squire.short_message(short, self.directory), short)
 
     def test_post_settle_activity_clears_only_exact_owned_text_without_submit(self):
         def settle(duration):

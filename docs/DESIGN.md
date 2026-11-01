@@ -40,7 +40,9 @@ its squire; a squire that is usually right when it speaks is worth having.
    teammate would. Its tmux window shows the readable exchange. Compact notes
    recover it if the thread is lost.
 3. **It speaks directly into the agent's session.** Advice arrives as typed
-   input prefixed `[squire]`, one line of at most 400 characters. Both harnesses
+   input prefixed `[squire]`, one line, aimed at 400 characters or fewer and
+   delivered whole. Past a 4000-character safety cap it is cut at a sentence
+   boundary and says where the full text is. Both harnesses
    queue input typed while they work.
 4. **The agent stays in charge.** It talks back through `squire tell` to ask
    "why?", correct the squire's reading or tune it ("don't interrupt me for

@@ -141,8 +141,10 @@ and a required boolean `withdraw_undelivered`:
 ```
 
 Use an empty `message` for silence. Otherwise put only the short nudge in
-`message`, at most 400 characters, on one line without control characters;
-the CLI collapses whitespace, caps the text and supplies `[squire]`.
+`message`, on one line without control characters. Aim for 400 characters or
+fewer: two or three sentences. Finish every sentence; the CLI delivers the
+whole message, collapses whitespace and supplies `[squire]`, and only cuts a
+message longer than 4000 characters, at a sentence boundary.
 Put your running understanding in
 `trajectory`, including relevant upstream facts and unresolved hypotheses.
 The CLI retains the plan, sent messages and tuning separately. Keep notes

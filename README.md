@@ -85,7 +85,7 @@ From the working agent’s own tmux pane, using the path to your checkout:
 
 The pair is the system: one worker, one observer, a plan, and a conversation. No committee required.
 
-Checks happen only when the transcript grows. The default interval is six minutes. Advice is at most 400 characters, and delivery waits for a recognized harness prompt without a draft or dialog. If the terminal doesn’t look safe to type into, Squire waits rather than guessing. Status shows deferred delivery and failures.
+Checks happen only when the transcript grows. The default interval is six minutes. Advice aims for 400 characters or fewer and is delivered whole (only past a 4000-character safety cap is it cut, at a sentence boundary, with a pointer to the full text), and delivery waits for a recognized harness prompt without a draft or dialog. If the terminal doesn’t look safe to type into, Squire waits rather than guessing. Status shows deferred delivery and failures.
 
 The observer reads session content and can investigate local files using a read-only shell. That context goes to the observer’s model provider, so choose it with the same care as your working agent.
 
