@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parent
 STATE = Path(os.environ.get('SQUIRE_STATE_DIR', Path.home() / '.local/state/squire')).expanduser().resolve()
 INPUT_BUDGET = 120000
 RAW_BATCH = 8 * 1024 * 1024
+# The observer is asked to stay near 400 characters; this is only a safety cap.
+MESSAGE_LIMIT = 4000
 SCHEMA = {'type': 'object', 'properties': {
     'message': {'type': 'string'}, 'trajectory': {'type': 'string'},
     'withdraw_undelivered': {'type': 'boolean'},
@@ -502,11 +504,25 @@ def safe_composer(config, recent_activity=True):
     return composer(screen, config['harness'], cursor_y)
 
 
-def short_message(message):
+def short_message(message, directory=None):
+    """One line, delivered in full; only past MESSAGE_LIMIT is it cut, on a
+    sentence boundary, with the full text saved under `directory`."""
     # Never allow terminal editing controls to erase the prefix or choose a dialog.
     if any(unicodedata.category(c) == 'Cc' and not c.isspace() for c in message):
         raise ValueError('message contains terminal control characters')
-    return ' '.join(message.split())[:400].rstrip()
+    message = ' '.join(message.split())
+    if len(message) <= MESSAGE_LIMIT:
+        return message
+    full = None
+    if directory is not None:
+        full = Path(directory) / 'messages' / (time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6] + '.txt')
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(message + '\n')
+    suffix = f' (truncated, full text at {full})' if full else ' (truncated)'
+    head = message[:MESSAGE_LIMIT - len(suffix)]
+    ends = [m.end() for m in re.finditer(r'[.!?;:](?=\s)', head)]
+    cut = ends[-1] if ends and ends[-1] > len(head) // 2 else (head.rfind(' ') if ' ' in head else len(head))
+    return head[:cut].rstrip() + suffix
 
 
 def deliver(directory, message, expected_tuning=None):
@@ -613,7 +629,7 @@ def commit_decision(directory, notes, decision, cursor=None, tuning_version=None
     message = ''
     if decision['message']:
         try:
-            message = short_message(decision['message'])
+            message = short_message(decision['message'], directory)
         except ValueError as error:
             log_turn(directory, 'Kept judgment; discarded invalid advice: ' + str(error))
     previous = load(pending) if pending.exists() else None
